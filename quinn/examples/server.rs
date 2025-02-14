@@ -4,7 +4,7 @@
 
 use std::{
     ascii, fs, io,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{self, Path, PathBuf},
     str,
     sync::Arc,
@@ -25,8 +25,6 @@ struct Opt {
     /// file to log TLS keys to for debugging
     #[clap(long = "keylog")]
     keylog: bool,
-    /// directory to serve files from
-    root: PathBuf,
     /// TLS private key in PEM format
     #[clap(short = 'k', long = "key", requires = "cert")]
     key: Option<PathBuf>,
@@ -36,9 +34,6 @@ struct Opt {
     /// Enable stateless retries
     #[clap(long = "stateless-retry")]
     stateless_retry: bool,
-    /// Address to listen on
-    #[clap(long = "listen", default_value = "[::1]:4433")]
-    listen: SocketAddr,
     /// Client address to block
     #[clap(long = "block")]
     block: Option<SocketAddr>,
@@ -119,7 +114,8 @@ async fn run(options: Opt) -> Result<()> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = common::ALPN_QUIC_HTTP.iter().map(|&x| x.into()).collect();
+    // Use a simple custom protocol identifier
+    server_crypto.alpn_protocols = vec![b"solana-tpu".to_vec()];
     if options.keylog {
         server_crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
@@ -127,14 +123,10 @@ async fn run(options: Opt) -> Result<()> {
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     let transport_config = Arc::get_mut(&mut server_config.transport).unwrap();
-    transport_config.max_concurrent_uni_streams(0_u8.into());
+    transport_config.max_concurrent_uni_streams(100_u8.into());
 
-    let root = Arc::<Path>::from(options.root.clone());
-    if !root.exists() {
-        bail!("root path does not exist");
-    }
-
-    let endpoint = quinn::Endpoint::server(server_config, options.listen)?;
+    let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+    let endpoint = quinn::Endpoint::server(server_config, listen_addr)?;
     eprintln!("listening on {}", endpoint.local_addr()?);
 
     while let Some(conn) = endpoint.accept().await {
@@ -152,7 +144,7 @@ async fn run(options: Opt) -> Result<()> {
             conn.retry().unwrap();
         } else {
             info!("accepting connection");
-            let fut = handle_connection(root.clone(), conn);
+            let fut = handle_connection(conn);
             tokio::spawn(async move {
                 if let Err(e) = fut.await {
                     error!("connection failed: {reason}", reason = e.to_string())
@@ -164,7 +156,7 @@ async fn run(options: Opt) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(root: Arc<Path>, conn: quinn::Incoming) -> Result<()> {
+async fn handle_connection(conn: quinn::Incoming) -> Result<()> {
     let connection = conn.await?;
     let span = info_span!(
         "connection",
@@ -177,14 +169,14 @@ async fn handle_connection(root: Arc<Path>, conn: quinn::Incoming) -> Result<()>
             .map_or_else(|| "<none>".into(), |x| String::from_utf8_lossy(&x).into_owned())
     );
     async {
-        info!("established");
+        println!("established");
 
         // Each stream initiated by the client constitutes a new request.
         loop {
-            let stream = connection.accept_bi().await;
+            let stream = connection.accept_uni().await;
             let stream = match stream {
                 Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("connection closed");
+                    println!("connection closed");
                     return Ok(());
                 }
                 Err(e) => {
@@ -192,7 +184,7 @@ async fn handle_connection(root: Arc<Path>, conn: quinn::Incoming) -> Result<()>
                 }
                 Ok(s) => s,
             };
-            let fut = handle_request(root.clone(), stream);
+            let fut = handle_request(stream);
             tokio::spawn(
                 async move {
                     if let Err(e) = fut.await {
@@ -209,63 +201,18 @@ async fn handle_connection(root: Arc<Path>, conn: quinn::Incoming) -> Result<()>
 }
 
 async fn handle_request(
-    root: Arc<Path>,
-    (mut send, mut recv): (quinn::SendStream, quinn::RecvStream),
+    mut recv: quinn::RecvStream,
 ) -> Result<()> {
     let req = recv
         .read_to_end(64 * 1024)
         .await
         .map_err(|e| anyhow!("failed reading request: {}", e))?;
-    let mut escaped = String::new();
-    for &x in &req[..] {
-        let part = ascii::escape_default(x).collect::<Vec<_>>();
-        escaped.push_str(str::from_utf8(&part).unwrap());
-    }
-    info!(content = %escaped);
-    // Execute the request
-    let resp = process_get(&root, &req).unwrap_or_else(|e| {
-        error!("failed: {}", e);
-        format!("failed to process request: {e}\n").into_bytes()
-    });
-    // Write the response
-    send.write_all(&resp)
-        .await
-        .map_err(|e| anyhow!("failed to send response: {}", e))?;
-    // Gracefully terminate the stream
-    send.finish().unwrap();
-    info!("complete");
-    Ok(())
-}
 
-fn process_get(root: &Path, x: &[u8]) -> Result<Vec<u8>> {
-    if x.len() < 4 || &x[0..4] != b"GET " {
-        bail!("missing GET");
+    // Try to convert the received bytes to a string
+    match String::from_utf8(req.clone()) {
+        Ok(s) => println!("Received: {}", s),
+        Err(_) => println!("Received non-UTF8 data of {} bytes", req.len()),
     }
-    if x[4..].len() < 2 || &x[x.len() - 2..] != b"\r\n" {
-        bail!("missing \\r\\n");
-    }
-    let x = &x[4..x.len() - 2];
-    let end = x.iter().position(|&c| c == b' ').unwrap_or(x.len());
-    let path = str::from_utf8(&x[..end]).context("path is malformed UTF-8")?;
-    let path = Path::new(&path);
-    let mut real_path = PathBuf::from(root);
-    let mut components = path.components();
-    match components.next() {
-        Some(path::Component::RootDir) => {}
-        _ => {
-            bail!("path must be absolute");
-        }
-    }
-    for c in components {
-        match c {
-            path::Component::Normal(x) => {
-                real_path.push(x);
-            }
-            x => {
-                bail!("illegal component in path: {:?}", x);
-            }
-        }
-    }
-    let data = fs::read(&real_path).context("failed reading file")?;
-    Ok(data)
+
+    Ok(())
 }

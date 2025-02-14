@@ -4,57 +4,97 @@
 
 use std::{
     error::Error,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
+use clap::Parser;
 use proto::crypto::rustls::QuicClientConfig;
 use quinn::{ClientConfig, Endpoint};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use tokio::sync::Semaphore;
 
-mod common;
-use common::make_server_endpoint;
+#[derive(Parser, Debug)]
+#[clap(name = "insecure_client")]
+struct Opt {
+    /// Address to connect to
+    #[clap(long = "connect", default_value = "[::1]:4433")]
+    connect: SocketAddr,
+
+    /// Address to bind on
+    #[clap(long = "bind", default_value = "[::]:0")]
+    bind: SocketAddr,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    // server and client are running on the same thread asynchronously
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
-    tokio::spawn(run_server(addr));
-    run_client(addr).await?;
+    let opt = Opt::parse();
+    run_client(opt).await?;
     Ok(())
 }
 
-/// Runs a QUIC server bound to given address.
-async fn run_server(addr: SocketAddr) {
-    let (endpoint, _server_cert) = make_server_endpoint(addr).unwrap();
-    // accept a single connection
-    let incoming_conn = endpoint.accept().await.unwrap();
-    let conn = incoming_conn.await.unwrap();
-    println!(
-        "[server] connection accepted: addr={}",
-        conn.remote_address()
-    );
-}
+async fn run_client(options: Opt) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let mut endpoint = Endpoint::client(options.bind)?;
 
-async fn run_client(server_addr: SocketAddr) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let mut endpoint = Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+    let mut client_crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new())
+        .with_no_client_auth();
+
+    // Use the same simple protocol identifier as the server
+    client_crypto.alpn_protocols = vec![b"solana-tpu".to_vec()];
 
     endpoint.set_default_client_config(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new())
-            .with_no_client_auth(),
+        client_crypto,
     )?)));
 
     // connect to server
     let connection = endpoint
-        .connect(server_addr, "localhost")
+        .connect(options.connect, "localhost")
         .unwrap()
         .await
         .unwrap();
     println!("[client] connected: addr={}", connection.remote_address());
-    // Dropping handles allows the corresponding objects to automatically shut down
+    let semaphore = Arc::new(Semaphore::new(2000));  // Allow 2000 concurrent streams
+    let mut handles = Vec::new();
+
+    for i in 0..10000 {
+        let connection = connection.clone();
+        let semaphore = semaphore.clone();
+
+        // Acquire permit before spawning task
+        let permit = semaphore.acquire_owned().await.unwrap();
+
+        let handle = tokio::spawn(async move {
+            // Permit is held for the duration of this scope
+            let _permit = permit;  // Will be dropped when task completes
+
+            let mut stream = connection.open_uni().await.unwrap();
+            stream.write_all(b"hello").await.unwrap();
+            stream.finish().unwrap();
+
+            let res = tokio::time::timeout(Duration::from_secs(1), stream.stopped()).await;
+            match res {
+                Ok(res) => {
+                    if let Err(e) = res {
+                        println!("stream.stopped() failed: {}", e);
+                    }
+                }
+                Err(e) => {
+                    println!("timeout {}", e);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await;
+    }
+
     drop(connection);
+    println!("dropped connection");
     // Make sure the server has a chance to clean up
     endpoint.wait_idle().await;
 

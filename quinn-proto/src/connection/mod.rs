@@ -1406,6 +1406,8 @@ impl Connection {
         }
 
         let mut ack_eliciting_acked = false;
+
+        println!("newly_acked ranges: {:?}", newly_acked.iter().collect::<Vec<_>>());
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
                 if let Some(acked) = info.largest_acked {
@@ -1673,7 +1675,7 @@ impl Connection {
             self.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_packets += lost_packets.len() as u64;
             self.stats.path.lost_bytes += size_of_lost_packets;
-            trace!(
+            println!(
                 "packets lost: {:?}, bytes lost: {}",
                 lost_packets,
                 size_of_lost_packets
@@ -2631,6 +2633,7 @@ impl Connection {
         number: u64,
         packet: Packet,
     ) -> Result<(), TransportError> {
+        println!("processing packet {}", number);
         let payload = packet.payload.freeze();
         let mut is_probing_packet = true;
         let mut close = None;
